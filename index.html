@@ -8,6 +8,7 @@
   <meta name="apple-mobile-web-app-status-bar-style" content="default">
   <meta name="theme-color" content="#2563eb">
   <title>Spese Viaggi</title>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.112.0/dist/umd/supabase.min.js"></script>
 
   <style>
     :root {
@@ -321,8 +322,78 @@
       color: var(--accent);
     }
 
+    .sync-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+
+    .sync-status {
+      display: inline-block;
+      padding: 5px 9px;
+      border-radius: 999px;
+      background: #e5e7eb;
+      font-size: 0.8rem;
+      font-weight: 800;
+    }
+
+    .sync-status.online {
+      background: #d1fae5;
+      color: #065f46;
+    }
+
+    .sync-status.warning {
+      background: #fef3c7;
+      color: #92400e;
+    }
+
+    .auth-fields {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 8px;
+      margin-top: 10px;
+    }
+
+    @media (min-width: 700px) {
+      .auth-fields {
+        grid-template-columns: 1fr 1fr;
+      }
+    }
+
     #csvInput {
       display: none;
+    }
+
+    #backupInput {
+      display: none;
+    }
+
+    .undo-toast {
+      display: none;
+      position: fixed;
+      left: 50%;
+      bottom: calc(18px + env(safe-area-inset-bottom));
+      transform: translateX(-50%);
+      width: min(92%, 520px);
+      z-index: 1000;
+      background: #111827;
+      color: white;
+      border-radius: 13px;
+      padding: 10px 12px;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+    }
+
+    .undo-toast button {
+      min-height: 36px;
+      padding: 7px 11px;
+      background: white;
+      color: #111827;
+      flex: 0 0 auto;
     }
 
     footer {
@@ -340,6 +411,32 @@
   </header>
 
   <main>
+    <div class="trip-box">
+      <div class="sync-row">
+        <div>
+          <h2>Sincronizzazione</h2>
+          <div id="syncStatus" class="sync-status">Solo su questo dispositivo</div>
+        </div>
+        <button id="logoutButton" class="btn-secondary" onclick="logout()" style="display:none">Esci</button>
+      </div>
+
+      <div id="authLoggedOut">
+        <p class="expense-meta">Accedi per ritrovare automaticamente viaggi e spese su tutti i dispositivi.</p>
+        <div class="auth-fields">
+          <input id="authEmail" type="email" placeholder="Email" autocomplete="email">
+          <input id="authPassword" type="password" placeholder="Password (minimo 6 caratteri)" autocomplete="current-password">
+        </div>
+        <div class="actions">
+          <button class="btn-primary" onclick="login()">Accedi</button>
+          <button class="btn-secondary" onclick="register()">Crea account</button>
+        </div>
+      </div>
+
+      <div id="authLoggedIn" class="expense-meta" style="display:none">
+        Account: <strong id="authUserEmail"></strong>
+      </div>
+    </div>
+
     <div class="trip-box">
       <h2>Viaggio attivo</h2>
 
@@ -417,6 +514,9 @@
           <button class="btn-secondary" onclick="exportCSV()">Esporta CSV viaggio</button>
           <button class="btn-secondary" onclick="openCSVImport()">Importa CSV</button>
           <input id="csvInput" type="file" accept=".csv,text/csv" onchange="importCSV(event)">
+          <button class="btn-secondary" onclick="exportBackup()">Esporta backup completo</button>
+          <button class="btn-secondary" onclick="openBackupRestore()">Ripristina backup</button>
+          <input id="backupInput" type="file" accept=".json,application/json" onchange="restoreBackup(event)">
         </div>
       </section>
 
@@ -467,12 +567,21 @@
   </main>
 
   <footer>
-    Salvataggio locale nel browser. Per trasferire dati tra dispositivi usa Esporta CSV e Importa CSV.
+    Salvataggio locale nel browser. Usa il backup completo per conservare una copia di tutti i dati.
   </footer>
 
+  <div id="undoToast" class="undo-toast" role="status" aria-live="polite">
+    <span id="undoMessage">Elemento eliminato.</span>
+    <button onclick="undoLastDelete()">Annulla</button>
+  </div>
+
   <script>
-    const STORAGE_KEY = "travelExpensesApp_byTrip_v4";
+    const STORAGE_KEY = "travelExpensesApp_byTrip_v5";
+    const SUPABASE_URL = "https://nudfuvcwowaabclfjign.supabase.co";
+    const SUPABASE_KEY = "sb_publishable_u1dlcqBxXuGJFW6Nil_HnQ_rkdGec80";
+    const PRE_MIGRATION_KEY = "travelExpensesApp_beforeSupabase_v1";
     const OLD_KEYS = [
+      "travelExpensesApp_byTrip_v4",
       "travelExpensesApp_byTrip_v3",
       "travelExpensesApp_byTrip_v2",
       "travelExpensesApp_byTrip_v1",
@@ -485,9 +594,20 @@
     ];
 
     let trips = [];
-    let activeTrip = "";
+    let activeTripId = "";
     let expenses = [];
     let editingId = null;
+    let undoState = null;
+    let undoTimer = null;
+    let pendingDeletes = { trips: [], expenses: [] };
+    let currentUser = null;
+    let syncEnabled = false;
+    let initializingUserId = null;
+    let syncTimer = null;
+    let syncInProgress = false;
+    let realtimeChannel = null;
+
+    const supabaseClient = globalThis.supabase?.createClient(SUPABASE_URL, SUPABASE_KEY);
 
     const exchangeRatesToEUR = {
       EUR: 1,
@@ -501,67 +621,415 @@
         const current = localStorage.getItem(STORAGE_KEY);
 
         if (current) {
-          const data = JSON.parse(current);
-          trips = data.trips || [];
-          activeTrip = data.activeTrip || "";
-          expenses = data.expenses || [];
+          applyData(JSON.parse(current));
         } else {
           migrateOldData();
         }
       } catch (error) {
         trips = [];
-        activeTrip = "";
+        activeTripId = "";
         expenses = [];
       }
 
       if (!trips.length) {
-        trips = ["Nuovo viaggio"];
-        activeTrip = trips[0];
+        const trip = { id: createId(), name: "Nuovo viaggio" };
+        trips = [trip];
+        activeTripId = trip.id;
       }
 
-      if (!activeTrip || !trips.includes(activeTrip)) {
-        activeTrip = trips[0];
+      if (!activeTripId || !trips.some(trip => trip.id === activeTripId)) {
+        activeTripId = trips[0].id;
       }
 
       document.getElementById("date").valueAsDate = new Date();
       save();
       renderTripSelect();
       render();
+      initSupabase();
     }
 
     function migrateOldData() {
       trips = [];
-      activeTrip = "";
+      activeTripId = "";
       expenses = [];
 
       for (const key of OLD_KEYS) {
         const oldData = localStorage.getItem(key);
         if (!oldData) continue;
 
-        const parsed = JSON.parse(oldData);
-
-        if (Array.isArray(parsed)) {
-          expenses = parsed;
-          trips = [...new Set(expenses.map(item => item.trip).filter(Boolean))].sort();
-          activeTrip = trips[0] || "";
-          return;
-        }
-
-        if (parsed && typeof parsed === "object") {
-          trips = parsed.trips || [];
-          activeTrip = parsed.activeTrip || "";
-          expenses = parsed.expenses || [];
-          return;
-        }
+        applyData(JSON.parse(oldData));
+        return;
       }
     }
 
-    function save() {
+    function applyData(data) {
+      const source = Array.isArray(data) ? { expenses: data } : (data || {});
+      const sourceExpenses = Array.isArray(source.expenses) ? source.expenses : [];
+      const sourceTrips = Array.isArray(source.trips) ? source.trips : [];
+      const tripNames = sourceTrips
+        .map(trip => typeof trip === "string" ? trip : trip?.name)
+        .concat(sourceExpenses.map(item => item.trip))
+        .filter(Boolean);
+      const uniqueNames = [...new Set(tripNames)];
+      const idByName = new Map();
+
+      trips = sourceTrips
+        .filter(trip => trip && typeof trip === "object" && trip.id && trip.name)
+        .map(trip => ({ id: String(trip.id), name: String(trip.name).trim() }))
+        .filter(trip => trip.name);
+
+      trips.forEach(trip => idByName.set(trip.name, trip.id));
+
+      uniqueNames.forEach(name => {
+        if (idByName.has(name)) return;
+        const trip = { id: createId(), name: String(name).trim() };
+        if (!trip.name) return;
+        trips.push(trip);
+        idByName.set(trip.name, trip.id);
+      });
+
+      trips.sort((a, b) => a.name.localeCompare(b.name, "it"));
+
+      expenses = sourceExpenses.map(item => {
+        const tripId = item.tripId || idByName.get(item.trip);
+        if (!tripId || !trips.some(trip => trip.id === String(tripId))) return null;
+
+        const { trip, ...rest } = item;
+        return {
+          ...rest,
+          id: isUuid(rest.id) ? rest.id : createId(),
+          tripId: String(tripId)
+        };
+      }).filter(Boolean);
+
+      activeTripId = source.activeTripId || idByName.get(source.activeTrip) || trips[0]?.id || "";
+      pendingDeletes = {
+        trips: Array.isArray(source.pendingDeletes?.trips) ? source.pendingDeletes.trips : [],
+        expenses: Array.isArray(source.pendingDeletes?.expenses) ? source.pendingDeletes.expenses : []
+      };
+    }
+
+    function createId() {
+      if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+
+      return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, char => {
+        const random = Math.floor(Math.random() * 16);
+        const value = char === "x" ? random : (random & 0x3) | 0x8;
+        return value.toString(16);
+      });
+    }
+
+    function isUuid(value) {
+      return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(value || ""));
+    }
+
+    function getActiveTrip() {
+      return trips.find(trip => trip.id === activeTripId) || null;
+    }
+
+    function sameTripName(first, second) {
+      return String(first || "").trim().localeCompare(String(second || "").trim(), "it", { sensitivity: "accent" }) === 0;
+    }
+
+    function persistLocalOnly() {
       localStorage.setItem(STORAGE_KEY, JSON.stringify({
+        version: 5,
         trips,
-        activeTrip,
-        expenses
+        activeTripId,
+        expenses,
+        pendingDeletes
       }));
+    }
+
+    function save() {
+      persistLocalOnly();
+
+      scheduleSync();
+    }
+
+    async function initSupabase() {
+      if (!supabaseClient) {
+        setSyncStatus("Sincronizzazione non disponibile", "warning");
+        return;
+      }
+
+      window.addEventListener("online", () => {
+        if (currentUser && syncEnabled) scheduleSync(0);
+      });
+      window.addEventListener("offline", () => setSyncStatus("Offline: dati salvati sul dispositivo", "warning"));
+
+      supabaseClient.auth.onAuthStateChange((_event, session) => {
+        setTimeout(() => handleSession(session), 0);
+      });
+
+      const { data, error } = await supabaseClient.auth.getSession();
+      if (error) {
+        setSyncStatus("Errore di accesso", "warning");
+        return;
+      }
+
+      await handleSession(data.session);
+    }
+
+    async function register() {
+      const email = getValue("authEmail");
+      const password = document.getElementById("authPassword").value;
+
+      if (!email || password.length < 6) {
+        alert("Inserisci un'email valida e una password di almeno 6 caratteri.");
+        return;
+      }
+
+      setSyncStatus("Creazione account...", "warning");
+      const { data, error } = await supabaseClient.auth.signUp({
+        email,
+        password,
+        options: { emailRedirectTo: window.location.origin + window.location.pathname }
+      });
+
+      if (error) {
+        setSyncStatus("Account non creato", "warning");
+        alert("Impossibile creare l'account: " + error.message);
+        return;
+      }
+
+      if (!data.session) {
+        setSyncStatus("Controlla la tua email", "warning");
+        alert("Account creato. Apri l'email di conferma, poi torna qui e premi Accedi.");
+      }
+    }
+
+    async function login() {
+      const email = getValue("authEmail");
+      const password = document.getElementById("authPassword").value;
+
+      if (!email || !password) {
+        alert("Inserisci email e password.");
+        return;
+      }
+
+      setSyncStatus("Accesso...", "warning");
+      const { error } = await supabaseClient.auth.signInWithPassword({ email, password });
+
+      if (error) {
+        setSyncStatus("Accesso non riuscito", "warning");
+        alert("Accesso non riuscito: " + error.message);
+      }
+    }
+
+    async function logout() {
+      await supabaseClient.auth.signOut();
+    }
+
+    async function handleSession(session) {
+      if (!session?.user) {
+        currentUser = null;
+        syncEnabled = false;
+        if (realtimeChannel) {
+          await supabaseClient.removeChannel(realtimeChannel);
+          realtimeChannel = null;
+        }
+        document.getElementById("authLoggedOut").style.display = "block";
+        document.getElementById("authLoggedIn").style.display = "none";
+        document.getElementById("logoutButton").style.display = "none";
+        setSyncStatus("Solo su questo dispositivo");
+        return;
+      }
+
+      if (currentUser?.id === session.user.id && (syncEnabled || initializingUserId === session.user.id)) return;
+
+      currentUser = session.user;
+      syncEnabled = false;
+      initializingUserId = currentUser.id;
+      document.getElementById("authLoggedOut").style.display = "none";
+      document.getElementById("authLoggedIn").style.display = "block";
+      document.getElementById("logoutButton").style.display = "block";
+      document.getElementById("authUserEmail").textContent = currentUser.email || "utente";
+      try {
+        await initializeRemoteData();
+      } finally {
+        initializingUserId = null;
+      }
+    }
+
+    async function initializeRemoteData() {
+      setSyncStatus("Verifica dei dati...", "warning");
+      const remote = await fetchRemoteData();
+      if (!remote) return;
+
+      const migrationKey = PRE_MIGRATION_KEY + ":completed:" + currentUser.id;
+      const hasMeaningfulLocalData = expenses.length > 0 || trips.length > 1 || trips[0]?.name !== "Nuovo viaggio";
+
+      if (!remote.trips.length) {
+        localStorage.setItem(
+          PRE_MIGRATION_KEY + ":" + currentUser.id,
+          JSON.stringify({ version: 5, savedAt: new Date().toISOString(), trips, activeTripId, expenses })
+        );
+        syncEnabled = true;
+        const synced = await syncToSupabase();
+        if (!synced) return;
+
+        const verification = await fetchRemoteData();
+        if (!verification || verification.trips.length !== trips.length || verification.expenses.length !== expenses.length) {
+          syncEnabled = false;
+          setSyncStatus("Migrazione da verificare", "warning");
+          alert("La copia online non coincide con i dati locali. I dati locali sono rimasti invariati.");
+          return;
+        }
+
+        localStorage.setItem(migrationKey, new Date().toISOString());
+      } else {
+        if (!localStorage.getItem(migrationKey) && hasMeaningfulLocalData) {
+          const useRemote = confirm(
+            "Questo account contiene già " + remote.trips.length + " viaggi e " + remote.expenses.length + " spese online.\n\n" +
+            "Premi OK per usare i dati online su questo dispositivo. I dati locali resteranno disponibili nel backup di sicurezza interno."
+          );
+          if (!useRemote) {
+            setSyncStatus("Sincronizzazione sospesa", "warning");
+            return;
+          }
+          localStorage.setItem(
+            PRE_MIGRATION_KEY + ":" + currentUser.id,
+            JSON.stringify({ version: 5, savedAt: new Date().toISOString(), trips, activeTripId, expenses })
+          );
+        }
+
+        applyRemoteData(remote);
+        localStorage.setItem(migrationKey, new Date().toISOString());
+        syncEnabled = true;
+      }
+
+      subscribeRealtime();
+      setSyncStatus("Sincronizzato", "online");
+    }
+
+    async function fetchRemoteData() {
+      const [tripsResult, expensesResult] = await Promise.all([
+        supabaseClient.from("trips").select("id,name").order("name"),
+        supabaseClient.from("expenses").select("id,trip_id,expense_date,category,description,amount,currency,amount_eur,payment,notes")
+      ]);
+
+      const error = tripsResult.error || expensesResult.error;
+      if (error) {
+        setSyncStatus("Errore di sincronizzazione", "warning");
+        alert("Impossibile leggere i dati online: " + error.message);
+        return null;
+      }
+
+      return { trips: tripsResult.data || [], expenses: expensesResult.data || [] };
+    }
+
+    function applyRemoteData(remote) {
+      const previousActiveTripId = activeTripId;
+      trips = remote.trips.map(trip => ({ id: trip.id, name: trip.name }));
+      expenses = remote.expenses.map(expense => ({
+        id: expense.id,
+        tripId: expense.trip_id,
+        date: expense.expense_date,
+        category: expense.category,
+        description: expense.description,
+        amount: Number(expense.amount),
+        currency: expense.currency,
+        amountEUR: Number(expense.amount_eur),
+        payment: expense.payment,
+        notes: expense.notes || ""
+      }));
+      activeTripId = trips.some(trip => trip.id === previousActiveTripId) ? previousActiveTripId : trips[0]?.id || "";
+      pendingDeletes = { trips: [], expenses: [] };
+      persistLocalOnly();
+      renderTripSelect();
+      render();
+    }
+
+    function scheduleSync(delay = 600) {
+      if (!currentUser || !syncEnabled || !navigator.onLine) return;
+      clearTimeout(syncTimer);
+      syncTimer = setTimeout(syncToSupabase, delay);
+    }
+
+    async function syncToSupabase() {
+      if (!currentUser || !syncEnabled || syncInProgress || !navigator.onLine) return false;
+      syncInProgress = true;
+      setSyncStatus("Sincronizzazione...", "warning");
+
+      try {
+        const tripRows = trips.map(trip => ({ id: trip.id, user_id: currentUser.id, name: trip.name }));
+        const expenseRows = expenses.map(expense => ({
+          id: expense.id,
+          user_id: currentUser.id,
+          trip_id: expense.tripId,
+          expense_date: expense.date,
+          category: expense.category,
+          description: expense.description,
+          amount: expense.amount,
+          currency: expense.currency,
+          amount_eur: expense.amountEUR,
+          payment: expense.payment,
+          notes: expense.notes || ""
+        }));
+
+        if (tripRows.length) {
+          const { error } = await supabaseClient.from("trips").upsert(tripRows, { onConflict: "id" });
+          if (error) throw error;
+        }
+
+        if (expenseRows.length) {
+          const { error } = await supabaseClient.from("expenses").upsert(expenseRows, { onConflict: "id" });
+          if (error) throw error;
+        }
+
+        if (pendingDeletes.expenses.length) {
+          const { error } = await supabaseClient.from("expenses").delete().in("id", pendingDeletes.expenses);
+          if (error) throw error;
+        }
+
+        if (pendingDeletes.trips.length) {
+          const { error } = await supabaseClient.from("trips").delete().in("id", pendingDeletes.trips);
+          if (error) throw error;
+        }
+
+        pendingDeletes = { trips: [], expenses: [] };
+        persistLocalOnly();
+        setSyncStatus("Sincronizzato", "online");
+        return true;
+      } catch (error) {
+        console.error("Errore di sincronizzazione:", error);
+        setSyncStatus("Dati locali in attesa", "warning");
+        return false;
+      } finally {
+        syncInProgress = false;
+      }
+    }
+
+    function subscribeRealtime() {
+      if (realtimeChannel) supabaseClient.removeChannel(realtimeChannel);
+
+      let reloadTimer;
+      const reload = () => {
+        clearTimeout(reloadTimer);
+        reloadTimer = setTimeout(loadRemoteData, 350);
+      };
+
+      realtimeChannel = supabaseClient
+        .channel("spese-viaggi-" + currentUser.id)
+        .on("postgres_changes", { event: "*", schema: "public", table: "trips" }, reload)
+        .on("postgres_changes", { event: "*", schema: "public", table: "expenses" }, reload)
+        .subscribe();
+    }
+
+    async function loadRemoteData() {
+      if (!currentUser || !syncEnabled || syncInProgress) return;
+      const remote = await fetchRemoteData();
+      if (remote) {
+        applyRemoteData(remote);
+        setSyncStatus("Sincronizzato", "online");
+      }
+    }
+
+    function setSyncStatus(message, type = "") {
+      const status = document.getElementById("syncStatus");
+      status.textContent = message;
+      status.className = "sync-status" + (type ? " " + type : "");
     }
 
     function getValue(id) {
@@ -594,8 +1062,10 @@
         return;
       }
 
-      if (trips.includes(name)) {
-        activeTrip = name;
+      const existingTrip = trips.find(trip => sameTripName(trip.name, name));
+
+      if (existingTrip) {
+        activeTripId = existingTrip.id;
         document.getElementById("newTripName").value = "";
         save();
         renderTripSelect();
@@ -603,9 +1073,10 @@
         return;
       }
 
-      trips.push(name);
-      trips.sort();
-      activeTrip = name;
+      const trip = { id: createId(), name };
+      trips.push(trip);
+      trips.sort((a, b) => a.name.localeCompare(b.name, "it"));
+      activeTripId = trip.id;
 
       document.getElementById("newTripName").value = "";
 
@@ -616,13 +1087,14 @@
     }
 
     function renameTrip() {
-      if (!activeTrip) {
+      const trip = getActiveTrip();
+
+      if (!trip) {
         alert("Nessun viaggio selezionato.");
         return;
       }
 
-      const oldName = activeTrip;
-      const newName = prompt("Inserisci il nuovo nome del viaggio:", oldName)?.trim();
+      const newName = prompt("Inserisci il nuovo nome del viaggio:", trip.name)?.trim();
 
       if (newName === undefined) return;
 
@@ -631,18 +1103,15 @@
         return;
       }
 
-      if (newName === oldName) return;
+      if (newName === trip.name) return;
 
-      if (trips.includes(newName)) {
+      if (trips.some(item => item.id !== trip.id && sameTripName(item.name, newName))) {
         alert("Esiste già un viaggio con questo nome.");
         return;
       }
 
-      trips = trips.map(trip => trip === oldName ? newName : trip).sort();
-      expenses = expenses.map(item =>
-        item.trip === oldName ? { ...item, trip: newName } : item
-      );
-      activeTrip = newName;
+      trip.name = newName;
+      trips.sort((a, b) => a.name.localeCompare(b.name, "it"));
 
       save();
       renderTripSelect();
@@ -650,30 +1119,34 @@
     }
 
     function deleteTrip() {
-      if (!activeTrip) {
+      const trip = getActiveTrip();
+
+      if (!trip) {
         alert("Nessun viaggio selezionato.");
         return;
       }
 
-      const tripExpensesCount = expenses.filter(item => item.trip === activeTrip).length;
+      const tripExpensesCount = expenses.filter(item => item.tripId === trip.id).length;
 
       const message =
-        "Vuoi eliminare il viaggio \"" + activeTrip + "\"?\n\n" +
+        "Vuoi eliminare il viaggio \"" + trip.name + "\"?\n\n" +
         "Verranno eliminate anche " + tripExpensesCount + " spese associate a questo viaggio.\n\n" +
-        "Operazione non annullabile.";
+        "Potrai annullare subito dopo.";
 
       if (!confirm(message)) return;
 
-      const tripToDelete = activeTrip;
+      rememberUndo("Viaggio eliminato.");
+      pendingDeletes.trips = [...new Set(pendingDeletes.trips.concat(trip.id))];
 
-      expenses = expenses.filter(item => item.trip !== tripToDelete);
-      trips = trips.filter(trip => trip !== tripToDelete);
+      expenses = expenses.filter(item => item.tripId !== trip.id);
+      trips = trips.filter(item => item.id !== trip.id);
 
       if (!trips.length) {
-        trips = ["Nuovo viaggio"];
-        activeTrip = "Nuovo viaggio";
+        const replacement = { id: createId(), name: "Nuovo viaggio" };
+        trips = [replacement];
+        activeTripId = replacement.id;
       } else {
-        activeTrip = trips[0];
+        activeTripId = trips[0].id;
       }
 
       cancelEdit();
@@ -682,6 +1155,7 @@
       save();
       renderTripSelect();
       render();
+      showUndo();
     }
 
     function renderTripSelect() {
@@ -690,16 +1164,16 @@
 
       trips.forEach(trip => {
         const option = document.createElement("option");
-        option.value = trip;
-        option.textContent = trip;
+        option.value = trip.id;
+        option.textContent = trip.name;
         select.appendChild(option);
       });
 
-      select.value = activeTrip;
+      select.value = activeTripId;
     }
 
     function changeActiveTrip() {
-      activeTrip = document.getElementById("activeTrip").value;
+      activeTripId = document.getElementById("activeTrip").value;
       document.getElementById("filterCategory").value = "";
       cancelEdit();
       save();
@@ -707,7 +1181,7 @@
     }
 
     function buildExpenseFromForm(existingId) {
-      if (!activeTrip) {
+      if (!getActiveTrip()) {
         alert("Prima crea o seleziona un viaggio.");
         return null;
       }
@@ -726,8 +1200,8 @@
       }
 
       return {
-        id: existingId || Date.now(),
-        trip: activeTrip,
+        id: existingId || createId(),
+        tripId: activeTripId,
         date,
         category,
         description,
@@ -761,7 +1235,7 @@
       if (!expense) return;
 
       editingId = id;
-      activeTrip = expense.trip;
+      activeTripId = expense.tripId;
 
       document.getElementById("date").value = expense.date || "";
       document.getElementById("category").value = expense.category || "Altro";
@@ -803,11 +1277,56 @@
     function deleteExpense(id) {
       if (!confirm("Vuoi eliminare questa spesa?")) return;
 
+      rememberUndo("Spesa eliminata.");
+      pendingDeletes.expenses = [...new Set(pendingDeletes.expenses.concat(id))];
       expenses = expenses.filter(item => item.id !== id);
 
       if (editingId === id) cancelEdit();
 
       save();
+      render();
+      showUndo();
+    }
+
+    function rememberUndo(message) {
+      undoState = {
+        message,
+        trips: trips.map(trip => ({ ...trip })),
+        expenses: expenses.map(expense => ({ ...expense })),
+        activeTripId,
+        pendingDeletes: {
+          trips: [...pendingDeletes.trips],
+          expenses: [...pendingDeletes.expenses]
+        }
+      };
+    }
+
+    function showUndo() {
+      if (!undoState) return;
+
+      clearTimeout(undoTimer);
+      document.getElementById("undoMessage").textContent = undoState.message;
+      document.getElementById("undoToast").style.display = "flex";
+      undoTimer = setTimeout(clearUndo, 8000);
+    }
+
+    function clearUndo() {
+      clearTimeout(undoTimer);
+      undoTimer = null;
+      undoState = null;
+      document.getElementById("undoToast").style.display = "none";
+    }
+
+    function undoLastDelete() {
+      if (!undoState) return;
+
+      trips = undoState.trips;
+      expenses = undoState.expenses;
+      activeTripId = undoState.activeTripId;
+      pendingDeletes = undoState.pendingDeletes;
+      clearUndo();
+      save();
+      renderTripSelect();
       render();
     }
 
@@ -816,7 +1335,7 @@
 
       return expenses
         .filter(item =>
-          item.trip === activeTrip &&
+          item.tripId === activeTripId &&
           (!selectedCategory || item.category === selectedCategory)
         )
         .sort((a, b) => new Date(b.date) - new Date(a.date));
@@ -825,7 +1344,7 @@
     function render() {
       renderTripSelect();
 
-      document.getElementById("selectedTripLabel").textContent = activeTrip || "-";
+      document.getElementById("selectedTripLabel").textContent = getActiveTrip()?.name || "-";
 
       const filtered = getFilteredExpenses();
       const total = filtered.reduce((sum, item) => sum + (item.amountEUR || 0), 0);
@@ -871,8 +1390,8 @@
           </div>
 
           <div class="row-buttons">
-            <button class="btn-warning small-btn" onclick="editExpense(${item.id})">Modifica</button>
-            <button class="btn-danger small-btn" onclick="deleteExpense(${item.id})">Elimina</button>
+            <button class="btn-warning small-btn" onclick="editExpense('${item.id}')">Modifica</button>
+            <button class="btn-danger small-btn" onclick="deleteExpense('${item.id}')">Elimina</button>
           </div>
         </div>
       `).join("") + '</div>';
@@ -889,9 +1408,10 @@
     }
 
     function exportCSV() {
-      const filtered = expenses.filter(item => item.trip === activeTrip);
+      const trip = getActiveTrip();
+      const filtered = expenses.filter(item => item.tripId === activeTripId);
 
-      if (!filtered.length) {
+      if (!trip || !filtered.length) {
         alert("Non ci sono spese da esportare per questo viaggio.");
         return;
       }
@@ -899,7 +1419,7 @@
       const rows = [
         ["Viaggio", "Data", "Categoria", "Descrizione", "Importo", "Valuta", "Importo EUR stimato", "Pagamento", "Note"],
         ...filtered.map(item => [
-          item.trip,
+          trip.name,
           item.date,
           item.category,
           item.description,
@@ -911,7 +1431,87 @@
         ])
       ];
 
-      downloadCSV(rows, activeTrip);
+      downloadCSV(rows, trip.name);
+    }
+
+    function exportBackup(label = "completo") {
+      const backup = {
+        app: "Spese Viaggi",
+        version: 5,
+        exportedAt: new Date().toISOString(),
+        trips,
+        activeTripId,
+        expenses
+      };
+      const date = new Date().toISOString().slice(0, 10);
+      downloadFile(
+        JSON.stringify(backup, null, 2),
+        "backup_spese_viaggi_" + label + "_" + date + ".json",
+        "application/json;charset=utf-8;"
+      );
+    }
+
+    function downloadFile(content, filename, type) {
+      const blob = new Blob([content], { type });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+
+    function openBackupRestore() {
+      document.getElementById("backupInput").click();
+    }
+
+    function restoreBackup(event) {
+      const file = event.target.files[0];
+      if (!file) return;
+
+      const reader = new FileReader();
+      reader.onload = function(e) {
+        const currentData = {
+          trips: trips.map(trip => ({ ...trip })),
+          activeTripId,
+          expenses: expenses.map(expense => ({ ...expense }))
+        };
+
+        try {
+          const backup = JSON.parse(e.target.result);
+
+          if (backup?.app !== "Spese Viaggi" || !Array.isArray(backup.trips) || !Array.isArray(backup.expenses)) {
+            throw new Error("Formato non valido");
+          }
+
+          const message =
+            "Il backup contiene " + backup.trips.length + " viaggi e " + backup.expenses.length + " spese.\n\n" +
+            "I dati attuali verranno sostituiti. Prima verrà scaricata automaticamente una copia di sicurezza.";
+
+          if (!confirm(message)) return;
+
+          exportBackup("prima_del_ripristino");
+          applyData(backup);
+
+          if (!trips.length) throw new Error("Il backup non contiene viaggi validi");
+
+          cancelEdit();
+          save();
+          renderTripSelect();
+          render();
+          alert("Backup ripristinato correttamente.");
+        } catch (error) {
+          trips = currentData.trips;
+          activeTripId = currentData.activeTripId;
+          expenses = currentData.expenses;
+          alert("Backup non riconosciuto o danneggiato. I dati attuali non sono stati modificati.");
+        } finally {
+          event.target.value = "";
+        }
+      };
+      reader.readAsText(file, "UTF-8");
     }
 
     function downloadCSV(rows, tripName) {
@@ -919,20 +1519,8 @@
         .map(row => row.map(field => `"${String(field ?? "").replace(/"/g, '""')}"`).join(";"))
         .join("\n");
 
-      const blob = new Blob(["\ufeff" + csv], { type: "text/csv;charset=utf-8;" });
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement("a");
-
       const safeTripName = (tripName || "viaggio").replace(/[^a-z0-9]/gi, "_").toLowerCase();
-
-      link.href = url;
-      link.download = "spese_" + safeTripName + ".csv";
-
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      downloadFile("\ufeff" + csv, "spese_" + safeTripName + ".csv", "text/csv;charset=utf-8;");
     }
 
     function openCSVImport() {
@@ -975,23 +1563,34 @@
           }
 
           const importedExpenses = [];
+          const importedTripIds = new Map();
 
           dataRows.forEach(row => {
-            const trip = cleanCell(row[index.trip]);
+            const tripName = cleanCell(row[index.trip]);
             const date = cleanCell(row[index.date]);
             const description = cleanCell(row[index.description]);
             const amount = parseAmount(cleanCell(row[index.amount]));
 
-            if (!trip || !date || !description || isNaN(amount) || amount <= 0) return;
+            if (!tripName || !date || !description || isNaN(amount) || amount <= 0) return;
 
             const category = index.category >= 0 ? cleanCell(row[index.category]) || "Altro" : "Altro";
             const currency = index.currency >= 0 ? cleanCell(row[index.currency]) || "EUR" : "EUR";
             const payment = index.payment >= 0 ? cleanCell(row[index.payment]) || "Carta" : "Carta";
             const notes = index.notes >= 0 ? cleanCell(row[index.notes]) : "";
 
+            let tripId = trips.find(trip => sameTripName(trip.name, tripName))?.id;
+            if (!tripId) {
+              const importedName = [...importedTripIds.keys()].find(name => sameTripName(name, tripName));
+              tripId = importedName ? importedTripIds.get(importedName) : null;
+            }
+            if (!tripId) {
+              tripId = createId();
+              importedTripIds.set(tripName, tripId);
+            }
+
             importedExpenses.push({
-              id: Date.now() + Math.floor(Math.random() * 1000000),
-              trip,
+              id: createId(),
+              tripId,
               date,
               category,
               description,
@@ -1016,14 +1615,12 @@
 
           expenses = expenses.concat(importedExpenses);
 
-          importedExpenses.forEach(item => {
-            if (!trips.includes(item.trip)) {
-              trips.push(item.trip);
-            }
+          importedTripIds.forEach((id, name) => {
+            trips.push({ id, name });
           });
 
-          trips.sort();
-          activeTrip = importedExpenses[0].trip;
+          trips.sort((a, b) => a.name.localeCompare(b.name, "it"));
+          activeTripId = importedExpenses[0].tripId;
 
           cancelEdit();
           save();
