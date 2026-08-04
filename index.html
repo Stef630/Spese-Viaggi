@@ -348,7 +348,10 @@
 
       <div class="trip-actions-row">
         <div class="expense-meta">Le spese visualizzate e il totale si riferiscono solo al viaggio selezionato.</div>
-        <button class="btn-danger" onclick="deleteTrip()">Elimina viaggio selezionato</button>
+        <div class="actions">
+          <button class="btn-warning" onclick="renameTrip()">Rinomina viaggio</button>
+          <button class="btn-danger" onclick="deleteTrip()">Elimina viaggio</button>
+        </div>
       </div>
 
       <h3>Aggiungi nuovo viaggio</h3>
@@ -607,6 +610,40 @@
       document.getElementById("newTripName").value = "";
 
       cancelEdit();
+      save();
+      renderTripSelect();
+      render();
+    }
+
+    function renameTrip() {
+      if (!activeTrip) {
+        alert("Nessun viaggio selezionato.");
+        return;
+      }
+
+      const oldName = activeTrip;
+      const newName = prompt("Inserisci il nuovo nome del viaggio:", oldName)?.trim();
+
+      if (newName === undefined) return;
+
+      if (!newName) {
+        alert("Il nome del viaggio non può essere vuoto.");
+        return;
+      }
+
+      if (newName === oldName) return;
+
+      if (trips.includes(newName)) {
+        alert("Esiste già un viaggio con questo nome.");
+        return;
+      }
+
+      trips = trips.map(trip => trip === oldName ? newName : trip).sort();
+      expenses = expenses.map(item =>
+        item.trip === oldName ? { ...item, trip: newName } : item
+      );
+      activeTrip = newName;
+
       save();
       renderTripSelect();
       render();
