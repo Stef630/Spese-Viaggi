@@ -429,11 +429,21 @@
         <div class="actions">
           <button class="btn-primary" onclick="login()">Accedi</button>
           <button class="btn-secondary" onclick="register()">Crea account</button>
+          <button class="btn-secondary" onclick="requestPasswordReset()">Password dimenticata?</button>
         </div>
       </div>
 
       <div id="authLoggedIn" class="expense-meta" style="display:none">
         Account: <strong id="authUserEmail"></strong>
+      </div>
+
+      <div id="passwordRecoveryPanel" style="display:none">
+        <p class="expense-meta">Scegli una nuova password per il tuo account.</p>
+        <div class="auth-fields">
+          <input id="newPassword" type="password" placeholder="Nuova password (minimo 6 caratteri)" autocomplete="new-password">
+          <input id="confirmNewPassword" type="password" placeholder="Ripeti la nuova password" autocomplete="new-password">
+        </div>
+        <button class="btn-primary" onclick="saveNewPassword()">Salva nuova password</button>
       </div>
     </div>
 
@@ -579,6 +589,7 @@
     const STORAGE_KEY = "travelExpensesApp_byTrip_v5";
     const SUPABASE_URL = "https://nudfuvcwowaabclfjign.supabase.co";
     const SUPABASE_KEY = "sb_publishable_u1dlcqBxXuGJFW6Nil_HnQ_rkdGec80";
+    const APP_URL = "https://stef630.github.io/Spese-Viaggi/";
     const PRE_MIGRATION_KEY = "travelExpensesApp_beforeSupabase_v1";
     const OLD_KEYS = [
       "travelExpensesApp_byTrip_v4",
@@ -603,6 +614,7 @@
     let currentUser = null;
     let syncEnabled = false;
     let initializingUserId = null;
+    let passwordRecoveryMode = false;
     let syncTimer = null;
     let syncInProgress = false;
     let realtimeChannel = null;
@@ -758,7 +770,11 @@
       });
       window.addEventListener("offline", () => setSyncStatus("Offline: dati salvati sul dispositivo", "warning"));
 
-      supabaseClient.auth.onAuthStateChange((_event, session) => {
+      supabaseClient.auth.onAuthStateChange((event, session) => {
+        if (event === "PASSWORD_RECOVERY") {
+          passwordRecoveryMode = true;
+          setTimeout(showPasswordRecovery, 0);
+        }
         setTimeout(() => handleSession(session), 0);
       });
 
@@ -813,8 +829,79 @@
 
       if (error) {
         setSyncStatus("Accesso non riuscito", "warning");
-        alert("Accesso non riuscito: " + error.message);
+        alert("Email o password non corretti. Se non ricordi la password, usa Password dimenticata.");
       }
+    }
+
+    async function requestPasswordReset() {
+      const email = getValue("authEmail");
+
+      if (!email) {
+        alert("Inserisci prima il tuo indirizzo email.");
+        return;
+      }
+
+      setSyncStatus("Invio email di recupero...", "warning");
+      const { error } = await supabaseClient.auth.resetPasswordForEmail(email, {
+        redirectTo: APP_URL
+      });
+
+      if (error) {
+        setSyncStatus("Email non inviata", "warning");
+        alert("Non è stato possibile inviare l'email di recupero. Riprova tra qualche minuto.");
+        return;
+      }
+
+      setSyncStatus("Controlla la tua email", "warning");
+      alert("Se l'indirizzo appartiene a un account, riceverai un'email. Apri il link una sola volta e scegli la nuova password nell'app.");
+    }
+
+    function showPasswordRecovery() {
+      document.getElementById("authLoggedOut").style.display = "none";
+      document.getElementById("authLoggedIn").style.display = "none";
+      document.getElementById("logoutButton").style.display = "none";
+      document.getElementById("passwordRecoveryPanel").style.display = "block";
+      setSyncStatus("Imposta la nuova password", "warning");
+      document.getElementById("newPassword").focus();
+    }
+
+    async function saveNewPassword() {
+      const newPassword = document.getElementById("newPassword").value;
+      const confirmation = document.getElementById("confirmNewPassword").value;
+
+      if (newPassword.length < 6) {
+        alert("La nuova password deve contenere almeno 6 caratteri.");
+        return;
+      }
+
+      if (newPassword !== confirmation) {
+        alert("Le due password non coincidono.");
+        return;
+      }
+
+      setSyncStatus("Aggiornamento password...", "warning");
+      const { error } = await supabaseClient.auth.updateUser({ password: newPassword });
+
+      if (error) {
+        setSyncStatus("Password non aggiornata", "warning");
+        alert("Il link potrebbe essere scaduto o già utilizzato. Richiedi una nuova email.");
+        return;
+      }
+
+      passwordRecoveryMode = false;
+      document.getElementById("newPassword").value = "";
+      document.getElementById("confirmNewPassword").value = "";
+      document.getElementById("passwordRecoveryPanel").style.display = "none";
+      document.getElementById("authLoggedIn").style.display = "block";
+      document.getElementById("logoutButton").style.display = "block";
+      history.replaceState(null, "", window.location.pathname);
+      initializingUserId = currentUser.id;
+      try {
+        await initializeRemoteData();
+      } finally {
+        initializingUserId = null;
+      }
+      alert("Password aggiornata correttamente. Ora sei connesso.");
     }
 
     async function logout() {
@@ -831,6 +918,7 @@
         }
         document.getElementById("authLoggedOut").style.display = "block";
         document.getElementById("authLoggedIn").style.display = "none";
+        document.getElementById("passwordRecoveryPanel").style.display = "none";
         document.getElementById("logoutButton").style.display = "none";
         setSyncStatus("Solo su questo dispositivo");
         return;
@@ -842,9 +930,17 @@
       syncEnabled = false;
       initializingUserId = currentUser.id;
       document.getElementById("authLoggedOut").style.display = "none";
-      document.getElementById("authLoggedIn").style.display = "block";
-      document.getElementById("logoutButton").style.display = "block";
+      document.getElementById("authLoggedIn").style.display = passwordRecoveryMode ? "none" : "block";
+      document.getElementById("passwordRecoveryPanel").style.display = passwordRecoveryMode ? "block" : "none";
+      document.getElementById("logoutButton").style.display = passwordRecoveryMode ? "none" : "block";
       document.getElementById("authUserEmail").textContent = currentUser.email || "utente";
+
+      if (passwordRecoveryMode) {
+        initializingUserId = null;
+        setSyncStatus("Imposta la nuova password", "warning");
+        return;
+      }
+
       try {
         await initializeRemoteData();
       } finally {
